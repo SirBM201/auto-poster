@@ -1,0 +1,7 @@
+.env
+*.pyc
+__pycache__/
+client_secret.json
+youtube_token.json
+.vscode/
+.idea/

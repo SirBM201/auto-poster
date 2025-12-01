@@ -1,0 +1,6 @@
+{
+  "enabled": true,
+  "caption_template": "{title}\n\n#Faith #DailyWord #Christian",
+  "video_category": "tweet_video",
+  "max_retries": 3
+}
