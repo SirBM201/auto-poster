@@ -1,62 +1,118 @@
 name: Auto Social Video Poster
 
 on:
-  # Run every day at 06:00 UTC (09:00 Kuwait time, UTC+3)
+  # Kuwait is UTC+3, so:
+  # 09:00 Kuwait  -> 06:00 UTC
+  # 09:30 Kuwait  -> 06:30 UTC
+  # 16:00 Kuwait  -> 13:00 UTC
+  # 16:30 Kuwait  -> 13:30 UTC
   schedule:
     - cron: "0 6 * * *"
-  # Allow manual trigger from the GitHub UI
+    - cron: "30 6 * * *"
+    - cron: "0 13 * * *"
+    - cron: "30 13 * * *"
   workflow_dispatch:
 
+env:
+  # AWS / S3
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION_NAME: ${{ secrets.AWS_REGION_NAME }}
+  S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+
+  # META / FACEBOOK / INSTAGRAM
+  META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+  FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+  IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+  IG_USER_ID: ${{ secrets.IG_USER_ID }}
+
+  # YOUTUBE (kept for future; disabled in CI)
+  YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+  YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+  YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+
+  # Optional WhatsApp / Make.com webhook
+  WHATSAPP_WEBHOOK_URL: ${{ secrets.WHATSAPP_WEBHOOK_URL }}
+
+  # Global platform toggles for CI
+  YOUTUBE_ENABLED: "false"
+  FACEBOOK_ENABLED: "true"
+  INSTAGRAM_ENABLED: "true"
+
+  RETRY_ENABLED: "true"
+  MAX_RETRIES: "2"
+  RETRY_DELAY_SECONDS: "60"
+  IG_MAX_WAIT_SECONDS: "600"
+
 jobs:
-  run-auto-poster:
+  reel_9am:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 6 * * *'
     runs-on: ubuntu-latest
-
     env:
-      # AWS / S3
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_REGION_NAME: ${{ secrets.AWS_REGION_NAME }}
-      S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
-
-      # META / FACEBOOK / INSTAGRAM
-      META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
-      FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
-      IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-      IG_USER_ID: ${{ secrets.IG_USER_ID }}
-
-      # YOUTUBE (kept for future use; disabled in this workflow)
-      YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-      YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-      YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-
-      # Optional: WhatsApp webhook (Make.com scenario URL)
-      WHATSAPP_WEBHOOK_URL: ${{ secrets.WHATSAPP_WEBHOOK_URL }}
-
-      # Platform toggles for GitHub run
-      YOUTUBE_ENABLED: "false"    # disable YouTube in CI for now
-      FACEBOOK_ENABLED: "true"
-      INSTAGRAM_ENABLED: "true"
-
-      # Retry behaviour (can adjust later)
-      RETRY_ENABLED: "true"
-      MAX_RETRIES: "2"
-      RETRY_DELAY_SECONDS: "60"
-
+      SLOT_FILTER: "reel_9am"
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install boto3 requests python-dotenv \
                      google-api-python-client google-auth-oauthlib google-auth-httplib2
+      - name: Run auto_poster for reel_9am
+        run: python auto_poster.py
 
-      - name: Run auto_poster
+  std_9_30am:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 6 * * *'
+    runs-on: ubuntu-latest
+    env:
+      SLOT_FILTER: "std_9_30am"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
         run: |
-          python auto_poster.py
+          python -m pip install --upgrade pip
+          pip install boto3 requests python-dotenv \
+                     google-api-python-client google-auth-oauthlib google-auth-httplib2
+      - name: Run auto_poster for std_9_30am
+        run: python auto_poster.py
+
+  reel_4pm:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 13 * * *'
+    runs-on: ubuntu-latest
+    env:
+      SLOT_FILTER: "reel_4pm"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 requests python-dotenv \
+                     google-api-python-client google-auth-oauthlib google-auth-httplib2
+      - name: Run auto_poster for reel_4pm
+        run: python auto_poster.py
+
+  std_4_30pm:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 13 * * *'
+    runs-on: ubuntu-latest
+    env:
+      SLOT_FILTER: "std_4_30pm"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 requests python-dotenv \
+                     google-api-python-client google-auth-oauthlib google-auth-httplib2
+      - name: Run auto_poster for std_4_30pm
+        run: python auto_poster.py
