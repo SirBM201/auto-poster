@@ -6,7 +6,7 @@ import datetime
 from typing import List, Dict, Any, Optional
 
 import boto3
-from botocore.exceptions import NoCredentialsError, ClientError
+from botocore.exceptions import NoCredentialsError
 import requests
 from dotenv import load_dotenv
 
@@ -68,11 +68,12 @@ def choose_today_or_latest(objs: List[Dict[str, Any]], today_str: str) -> Option
 
 
 def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+    if path:
+        os.makedirs(path, exist_ok=True)
 
 
 def download_s3_object(s3_client, bucket: str, key: str, local_path: str) -> None:
-    ensure_dir(os.path.dirname(local_path) or ".")
+    ensure_dir(os.path.dirname(local_path))
     if os.path.exists(local_path):
         logging.info(f"Removed existing local file before download: {local_path}")
         os.remove(local_path)
@@ -235,7 +236,6 @@ def instagram_reels_upload(
     # Step 2: Poll container status
     status_url = f"https://graph.facebook.com/v20.0/{creation_id}"
     start_time = time.time()
-    check_count = 0
 
     while True:
         elapsed = time.time() - start_time
@@ -251,7 +251,6 @@ def instagram_reels_upload(
             timeout=600,
         )
 
-        check_count += 1
         if resp.status_code != 200:
             logging.error(
                 f"[Instagram] Status check failed — status={resp.status_code}, response={resp.text}"
@@ -300,9 +299,11 @@ def instagram_reels_upload(
 # =========================================================
 
 def send_whatsapp_summary(webhook_url: str, summary_text: str) -> None:
+    if not webhook_url:
+        return
     try:
         resp = requests.post(webhook_url, json={"text": summary_text}, timeout=30)
-        if resp.status_code >= 200 and resp.status_code < 300:
+        if 200 <= resp.status_code < 300:
             logging.info("WhatsApp / webhook alert sent successfully.")
         else:
             logging.error(
@@ -350,9 +351,10 @@ def process_slot(
     logging.info(f"[] Looking for objects under prefix '{prefix}'")
 
     if not objs:
-        msg = f"No .mp4 files found in prefix '{prefix}'"
-        logging.warning(f"[{slot_display_name}] {msg}")
-        return f"SKIPPED (no video)"
+        logging.warning(
+            f"[{slot_display_name}] No .mp4 files found in prefix '{prefix}'"
+        )
+        return "SKIPPED (no video)"
 
     # 2) Choose today's or latest
     chosen = choose_today_or_latest(objs, today_str)
@@ -361,11 +363,12 @@ def process_slot(
         return "SKIPPED (no suitable object)"
 
     key = chosen["Key"]
-    logging.info(
-        f"[{slot_display_name}] Today's file not found. Using latest file instead: {key}"
-        if today_str not in key
-        else f"[{slot_display_name}] Using today's file: {key}"
-    )
+    if today_str in key:
+        logging.info(f"[{slot_display_name}] Using today's file: {key}")
+    else:
+        logging.info(
+            f"[{slot_display_name}] Today's file not found. Using latest file instead: {key}"
+        )
 
     # 3) Download
     filename = key.split("/")[-1]
@@ -376,7 +379,6 @@ def process_slot(
     meta = parse_metadata_from_key(key)
     title = meta["title"]
     caption = meta["caption"]
-    date_str = meta["date"]
 
     logging.info(f"Metadata from filename: {meta}")
 
@@ -386,12 +388,16 @@ def process_slot(
     # 5) YouTube
     if youtube_enabled:
         logging.info(f"[{slot_display_name}] YouTube upload is ENABLED for this slot.")
+
         def yt_func():
             return upload_to_youtube(local_path, title, caption)
 
         if retry_enabled:
             yt_success = retry_operation(
-                f"YouTube ({slot_short_name})", yt_func, max_retries, retry_delay_seconds
+                f"YouTube ({slot_short_name})",
+                yt_func,
+                max_retries,
+                retry_delay_seconds,
             )
         else:
             yt_success = yt_func()
@@ -405,16 +411,24 @@ def process_slot(
     # 6) Facebook
     if facebook_enabled:
         if not fb_page_id or not fb_token:
-            logging.error(f"[{slot_display_name}] FB_PAGE_ID or META_ACCESS_TOKEN not set. Skipping Facebook.")
+            logging.error(
+                f"[{slot_display_name}] FB_PAGE_ID or META_ACCESS_TOKEN not set. Skipping Facebook."
+            )
             all_ok = False
             reasons.append("Facebook config missing")
         else:
+
             def fb_func():
-                return upload_to_facebook_video(fb_page_id, fb_token, local_path, caption)
+                return upload_to_facebook_video(
+                    fb_page_id, fb_token, local_path, caption
+                )
 
             if retry_enabled:
                 fb_success = retry_operation(
-                    f"Facebook ({slot_short_name})", fb_func, max_retries, retry_delay_seconds
+                    f"Facebook ({slot_short_name})",
+                    fb_func,
+                    max_retries,
+                    retry_delay_seconds,
                 )
             else:
                 fb_success = fb_func()
@@ -423,25 +437,39 @@ def process_slot(
                 all_ok = False
                 reasons.append("Facebook failed")
     else:
-        logging.info(f"[{slot_display_name}] Facebook upload is DISABLED for this slot.")
+        logging.info(
+            f"[{slot_display_name}] Facebook upload is DISABLED for this slot."
+        )
 
     # 7) Instagram
     if instagram_enabled:
         if not ig_user_id or not ig_token:
-            logging.error(f"[{slot_display_name}] IG_USER_ID or IG_ACCESS_TOKEN not set. Skipping Instagram.")
+            logging.error(
+                f"[{slot_display_name}] IG_USER_ID or IG_ACCESS_TOKEN not set. Skipping Instagram."
+            )
             all_ok = False
             reasons.append("Instagram config missing")
         else:
+
             def ig_func():
-                presigned_url = generate_presigned_url(s3_client, bucket, key, expires_in=3600)
+                presigned_url = generate_presigned_url(
+                    s3_client, bucket, key, expires_in=3600
+                )
                 logging.info("Pre-signed URL generated.")
                 return instagram_reels_upload(
-                    ig_user_id, ig_token, presigned_url, caption, max_wait_seconds=ig_max_wait_seconds
+                    ig_user_id,
+                    ig_token,
+                    presigned_url,
+                    caption,
+                    max_wait_seconds=ig_max_wait_seconds,
                 )
 
             if retry_enabled:
                 ig_success = retry_operation(
-                    f"Instagram ({slot_short_name})", ig_func, max_retries, retry_delay_seconds
+                    f"Instagram ({slot_short_name})",
+                    ig_func,
+                    max_retries,
+                    retry_delay_seconds,
                 )
             else:
                 ig_success = ig_func()
@@ -450,12 +478,14 @@ def process_slot(
                 all_ok = False
                 reasons.append("Instagram failed")
     else:
-        logging.info(f"[{slot_display_name}] Instagram upload is DISABLED for this slot.")
+        logging.info(
+            f"[{slot_display_name}] Instagram upload is DISABLED for this slot."
+        )
 
     # 8) Final status for this slot
     if all_ok:
         logging.info(f"[{slot_display_name}] All enabled uploads succeeded.")
-        # NOTE: We keep video in S3 for now for safety.
+        # We keep video in S3 for now.
         return "SUCCESS"
     else:
         reason_str = ", ".join(reasons) if reasons else "one or more uploads failed"
@@ -502,7 +532,7 @@ def main():
     retry_enabled = str_to_bool(os.getenv("RETRY_ENABLED", "true"))
     max_retries = int(os.getenv("MAX_RETRIES", "2"))
     retry_delay_seconds = int(os.getenv("RETRY_DELAY_SECONDS", "60"))
-    ig_max_wait_seconds = int(os.getenv("IG_MAX_WAIT_SECONDS", "600"))  # default 10 minutes
+    ig_max_wait_seconds = int(os.getenv("IG_MAX_WAIT_SECONDS", "600"))  # default 10 mins
 
     # --- WhatsApp webhook (optional) ---
     whatsapp_webhook_url = os.getenv("WHATSAPP_WEBHOOK_URL", "").strip()
@@ -535,9 +565,28 @@ def main():
         },
     ]
 
+    # --- SLOT_FILTER logic ---
+    slot_filter = os.getenv("SLOT_FILTER", "").strip().lower()
+    if slot_filter:
+        filtered = [s for s in slots if s["short_name"].lower() == slot_filter]
+        if not filtered:
+            available = ", ".join(s["short_name"] for s in slots)
+            logging.error(
+                f"SLOT_FILTER='{slot_filter}' did not match any slot. "
+                f"Available short names: {available}"
+            )
+            sys.exit(1)
+        slots_to_run = filtered
+        logging.info(
+            f"SLOT_FILTER is set to '{slot_filter}'. Only this slot will be processed."
+        )
+    else:
+        slots_to_run = slots
+        logging.info("SLOT_FILTER not set. All slots will be processed.")
+
     slot_results: Dict[str, str] = {}
 
-    for slot in slots:
+    for slot in slots_to_run:
         status = process_slot(
             slot_display_name=slot["display_name"],
             slot_short_name=slot["short_name"],
