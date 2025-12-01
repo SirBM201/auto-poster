@@ -87,7 +87,7 @@ def parse_metadata_from_key(key: str) -> Dict[str, str]:
     filename = key.split("/")[-1]
     name_no_ext = os.path.splitext(filename)[0]
 
-    # Expected pattern like: 2025-11-30 - The Royal Accident - Episode 01
+    # Expected pattern: 2025-11-30 - The Royal Accident - Episode 01
     date_part = name_no_ext[:10]
     title_part = name_no_ext
     if len(name_no_ext) > 13 and name_no_ext[10:13] == " - ":
@@ -210,8 +210,7 @@ def instagram_reels_upload(
     caption: str,
     max_wait_seconds: int = 600,
 ) -> bool:
-    """Upload a reel via pre-signed S3 URL, waiting up to max_wait_seconds."""
-    # Step 1: Create media container
+    """Upload a short Reel via pre-signed S3 URL."""
     create_url = f"https://graph.facebook.com/v20.0/{ig_user_id}/media"
     params = {
         "media_type": "REELS",
@@ -221,19 +220,18 @@ def instagram_reels_upload(
         "share_to_feed": "true",
     }
 
-    logging.info("[Instagram] Creating Reels media container...")
+    logging.info("[Instagram REELS] Creating media container...")
     resp = requests.post(create_url, data=params, timeout=600)
     if resp.status_code != 200:
         logging.error(
-            f"[Instagram] Failed to create media container — status={resp.status_code}, response={resp.text}"
+            f"[Instagram REELS] Failed to create media container — status={resp.status_code}, response={resp.text}"
         )
         return False
 
     data = resp.json()
     creation_id = data.get("id")
-    logging.info(f"Instagram container created — ID: {creation_id}")
+    logging.info(f"[Instagram REELS] Container created — ID: {creation_id}")
 
-    # Step 2: Poll container status
     status_url = f"https://graph.facebook.com/v20.0/{creation_id}"
     start_time = time.time()
 
@@ -241,7 +239,7 @@ def instagram_reels_upload(
         elapsed = time.time() - start_time
         if elapsed > max_wait_seconds:
             logging.error(
-                f"[Instagram] Media still not ready after {max_wait_seconds} seconds. Giving up."
+                f"[Instagram REELS] Media still not ready after {max_wait_seconds} seconds. Giving up."
             )
             return False
 
@@ -253,7 +251,7 @@ def instagram_reels_upload(
 
         if resp.status_code != 200:
             logging.error(
-                f"[Instagram] Status check failed — status={resp.status_code}, response={resp.text}"
+                f"[Instagram REELS] Status check failed — status={resp.status_code}, response={resp.text}"
             )
             time.sleep(5)
             continue
@@ -263,34 +261,124 @@ def instagram_reels_upload(
         status_msg = status_data.get("status")
 
         logging.info(
-            f"IG status check ({int(elapsed)}s): status_code={status_code}, status={status_msg}"
+            f"[Instagram REELS] Status ({int(elapsed)}s): status_code={status_code}, status={status_msg}"
         )
 
         if status_code == "FINISHED":
             break
         elif status_code == "ERROR":
-            logging.error("[Instagram] Status_code=ERROR. Aborting.")
+            logging.error("[Instagram REELS] status_code=ERROR. Aborting.")
             return False
 
         time.sleep(5)
 
-    # Step 3: Publish
     publish_url = f"https://graph.facebook.com/v20.0/{ig_user_id}/media_publish"
     publish_params = {
         "creation_id": creation_id,
         "access_token": ig_access_token,
     }
 
-    logging.info("[Instagram] Publishing media...")
+    logging.info("[Instagram REELS] Publishing media...")
     publish_resp = requests.post(publish_url, data=publish_params, timeout=600)
 
     if publish_resp.status_code != 200:
         logging.error(
-            f"[Instagram] Publish failed — status={publish_resp.status_code}, response={publish_resp.text}"
+            f"[Instagram REELS] Publish failed — status={publish_resp.status_code}, response={publish_resp.text}"
         )
         return False
 
-    logging.info(f"Instagram PUBLISH success — response: {publish_resp.text}")
+    logging.info(f"[Instagram REELS] PUBLISH success — response: {publish_resp.text}")
+    return True
+
+
+def instagram_feed_video_upload(
+    ig_user_id: str,
+    ig_access_token: str,
+    video_url: str,
+    caption: str,
+    max_wait_seconds: int = 600,
+) -> bool:
+    """
+    Upload a longer feed video (e.g. 4-minute) via pre-signed S3 URL.
+
+    Uses media_type=VIDEO so it posts as a regular feed video instead of a Reel.
+    """
+    create_url = f"https://graph.facebook.com/v20.0/{ig_user_id}/media"
+    params = {
+        "media_type": "VIDEO",
+        "video_url": video_url,
+        "caption": caption,
+        "access_token": ig_access_token,
+    }
+
+    logging.info("[Instagram FEED] Creating media container...")
+    resp = requests.post(create_url, data=params, timeout=600)
+    if resp.status_code != 200:
+        logging.error(
+            f"[Instagram FEED] Failed to create media container — status={resp.status_code}, response={resp.text}"
+        )
+        return False
+
+    data = resp.json()
+    creation_id = data.get("id")
+    logging.info(f"[Instagram FEED] Container created — ID: {creation_id}")
+
+    status_url = f"https://graph.facebook.com/v20.0/{creation_id}"
+    start_time = time.time()
+
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed > max_wait_seconds:
+            logging.error(
+                f"[Instagram FEED] Media still not ready after {max_wait_seconds} seconds. Giving up."
+            )
+            return False
+
+        resp = requests.get(
+            status_url,
+            params={"fields": "status_code,status", "access_token": ig_access_token},
+            timeout=600,
+        )
+
+        if resp.status_code != 200:
+            logging.error(
+                f"[Instagram FEED] Status check failed — status={resp.status_code}, response={resp.text}"
+            )
+            time.sleep(5)
+            continue
+
+        status_data = resp.json()
+        status_code = status_data.get("status_code")
+        status_msg = status_data.get("status")
+
+        logging.info(
+            f"[Instagram FEED] Status ({int(elapsed)}s): status_code={status_code}, status={status_msg}"
+        )
+
+        if status_code == "FINISHED":
+            break
+        elif status_code == "ERROR":
+            logging.error("[Instagram FEED] status_code=ERROR. Aborting.")
+            return False
+
+        time.sleep(5)
+
+    publish_url = f"https://graph.facebook.com/v20.0/{ig_user_id}/media_publish"
+    publish_params = {
+        "creation_id": creation_id,
+        "access_token": ig_access_token,
+    }
+
+    logging.info("[Instagram FEED] Publishing media...")
+    publish_resp = requests.post(publish_url, data=publish_params, timeout=600)
+
+    if publish_resp.status_code != 200:
+        logging.error(
+            f"[Instagram FEED] Publish failed — status={publish_resp.status_code}, response={publish_resp.text}"
+        )
+        return False
+
+    logging.info(f"[Instagram FEED] PUBLISH success — response: {publish_resp.text}")
     return True
 
 
@@ -456,13 +544,25 @@ def process_slot(
                     s3_client, bucket, key, expires_in=3600
                 )
                 logging.info("Pre-signed URL generated.")
-                return instagram_reels_upload(
-                    ig_user_id,
-                    ig_token,
-                    presigned_url,
-                    caption,
-                    max_wait_seconds=ig_max_wait_seconds,
-                )
+
+                if kind == "short":
+                    # Reels for short videos
+                    return instagram_reels_upload(
+                        ig_user_id,
+                        ig_token,
+                        presigned_url,
+                        caption,
+                        max_wait_seconds=ig_max_wait_seconds,
+                    )
+                else:
+                    # Feed video for 4-minute standard videos
+                    return instagram_feed_video_upload(
+                        ig_user_id,
+                        ig_token,
+                        presigned_url,
+                        caption,
+                        max_wait_seconds=ig_max_wait_seconds,
+                    )
 
             if retry_enabled:
                 ig_success = retry_operation(
@@ -524,7 +624,7 @@ def main():
     ig_access_token = os.getenv("IG_ACCESS_TOKEN")
     ig_user_id = os.getenv("IG_USER_ID")
 
-    # --- Feature toggles ---
+    # --- Feature toggles (default: ENABLED for YT + FB + IG) ---
     youtube_enabled = str_to_bool(os.getenv("YOUTUBE_ENABLED", "true"))
     facebook_enabled = str_to_bool(os.getenv("FACEBOOK_ENABLED", "true"))
     instagram_enabled = str_to_bool(os.getenv("INSTAGRAM_ENABLED", "true"))
@@ -532,7 +632,7 @@ def main():
     retry_enabled = str_to_bool(os.getenv("RETRY_ENABLED", "true"))
     max_retries = int(os.getenv("MAX_RETRIES", "2"))
     retry_delay_seconds = int(os.getenv("RETRY_DELAY_SECONDS", "60"))
-    ig_max_wait_seconds = int(os.getenv("IG_MAX_WAIT_SECONDS", "600"))  # default 10 mins
+    ig_max_wait_seconds = int(os.getenv("IG_MAX_WAIT_SECONDS", "600"))  # 10 mins
 
     # --- WhatsApp webhook (optional) ---
     whatsapp_webhook_url = os.getenv("WHATSAPP_WEBHOOK_URL", "").strip()
