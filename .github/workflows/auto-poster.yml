@@ -15,34 +15,34 @@ on:
 
 env:
   # AWS / S3
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  AWS_REGION_NAME: ${{ secrets.AWS_REGION_NAME }}
-  S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+  AWS_REGION_NAME:       ${{ secrets.AWS_REGION_NAME }}
+  S3_BUCKET_NAME:        ${{ secrets.S3_BUCKET_NAME }}
 
   # META / FACEBOOK / INSTAGRAM
   META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
-  FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
-  IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-  IG_USER_ID: ${{ secrets.IG_USER_ID }}
+  FB_PAGE_ID:        ${{ secrets.FB_PAGE_ID }}
+  IG_ACCESS_TOKEN:   ${{ secrets.IG_ACCESS_TOKEN }}
+  IG_USER_ID:        ${{ secrets.IG_USER_ID }}
 
-  # YOUTUBE (kept for future; disabled in CI)
-  YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-  YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-  YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+  # YOUTUBE (names must match auto_poster.py + your secrets panel)
+  YT_CLIENT_ID:     ${{ secrets.YT_CLIENT_ID }}
+  YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+  YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
 
   # Optional WhatsApp / Make.com webhook
   WHATSAPP_WEBHOOK_URL: ${{ secrets.WHATSAPP_WEBHOOK_URL }}
 
-  # Global platform toggles for CI
-  YOUTUBE_ENABLED: "false"
+  # (Currently not used by the script, but kept for future switches)
+  YOUTUBE_ENABLED:  "true"
   FACEBOOK_ENABLED: "true"
-  INSTAGRAM_ENABLED: "true"
+  INSTAGRAM_ENABLED:"true"
 
-  RETRY_ENABLED: "true"
-  MAX_RETRIES: "2"
-  RETRY_DELAY_SECONDS: "60"
-  IG_MAX_WAIT_SECONDS: "600"
+  RETRY_ENABLED:        "true"
+  MAX_RETRIES:          "2"
+  RETRY_DELAY_SECONDS:  "60"
+  IG_MAX_WAIT_SECONDS:  "600"
 
 jobs:
   reel_9am:
