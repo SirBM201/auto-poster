@@ -26,7 +26,7 @@ env:
   IG_ACCESS_TOKEN:   ${{ secrets.IG_ACCESS_TOKEN }}
   IG_USER_ID:        ${{ secrets.IG_USER_ID }}
 
-  # YOUTUBE (names match your secrets + auto_poster.py)
+  # YOUTUBE (names match auto_poster.py + your secrets)
   YT_CLIENT_ID:     ${{ secrets.YT_CLIENT_ID }}
   YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
   YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
@@ -35,9 +35,9 @@ env:
   WHATSAPP_WEBHOOK_URL: ${{ secrets.WHATSAPP_WEBHOOK_URL }}
 
   # Global platform toggles (not used in code yet, but kept)
-  YOUTUBE_ENABLED:  "true"
-  FACEBOOK_ENABLED: "true"
-  INSTAGRAM_ENABLED:"true"
+  YOUTUBE_ENABLED:   "true"
+  FACEBOOK_ENABLED:  "true"
+  INSTAGRAM_ENABLED: "true"
 
   RETRY_ENABLED:        "true"
   MAX_RETRIES:          "2"
