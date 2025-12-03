@@ -2,14 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-AUTO POSTING ENGINE v2.2  — BM SAFE VERSION (ENV-ONLY YOUTUBE)
---------------------------------------------------------------
+AUTO POSTING ENGINE v2.4  — BM SAFE VERSION (ENV-ONLY YOUTUBE + TIKTOK + IG LONG)
+---------------------------------------------------------------------------------
 - One script, multiple slots (reel_9am, reel_4pm, std_9_30am, std_4_30pm)
 - S3 → Download
 - Filename → Metadata (title/caption/date)
 - YouTube upload (short + long)
 - Facebook Page upload
-- Instagram Reels (short clips only)
+- Instagram:
+    - Shorts (slots type=short)  → Reels
+    - Long (slots type=standard) → Feed video
+- TikTok upload (short + up to 60 minutes, via tiktok_poster.py)
+- After SUCCESS on all enabled platforms:
+    - Copy S3 object to posted/<original_key>
+    - Delete original object
 - Slot filter via SLOT_FILTER env (for GitHub Actions cron)
 
 ENV RULES:
@@ -35,6 +41,10 @@ PLATFORM (OPTIONAL, enable each only when complete):
         IG_ACCESS_TOKEN
         IG_USER_ID   (or INSTAGRAM_USER_ID)
 
+    TIKTOK:
+        TIKTOK_ACCESS_TOKEN           (used by tiktok_poster.py)
+        TIKTOK_ENABLED=true|false     (toggle in this engine)
+
 OPTIONAL:
     SLACK_WEBHOOK_URL
     WHATSAPP_WEBHOOK_URL
@@ -44,16 +54,16 @@ OPTIONAL:
 import os
 import re
 import time
-import json
 import logging
 from datetime import date
 
 import boto3
-from botocore.exceptions import NoCredentialsError, ClientError
+from botocore.exceptions import ClientError
 import requests
 from dotenv import load_dotenv
 
 from fb_chunk_upload import fb_chunk_upload  # Facebook Page upload helper
+from tiktok_poster import post_video_to_tiktok, TikTokError  # TikTok uploader
 
 # ------------------------------------------------
 # Load .env (LOCAL ONLY — in GitHub, secrets are injected directly)
@@ -73,9 +83,10 @@ LOGGER = logging.getLogger("auto_poster")
 # ------------------------------------------------
 # Environment helpers
 # ------------------------------------------------
-def env(key: str):
-    """Simple env getter."""
-    return os.getenv(key)
+def env(key: str, default: str = None):
+    """Simple env getter with optional default."""
+    val = os.getenv(key)
+    return val if val is not None else default
 
 
 # Core AWS/S3 envs (required)
@@ -96,6 +107,10 @@ FB_PAGE_ID = env("FB_PAGE_ID")
 # Instagram (optional)
 IG_ACCESS_TOKEN = env("IG_ACCESS_TOKEN")
 IG_USER_ID = env("IG_USER_ID") or env("INSTAGRAM_USER_ID")
+
+# TikTok (via tiktok_poster.py)
+TIKTOK_ACCESS_TOKEN = env("TIKTOK_ACCESS_TOKEN")
+TIKTOK_ENABLED_FLAG = env("TIKTOK_ENABLED", "false").strip().lower() == "true"
 
 # Optional alerts (reserved for future use)
 SLACK_WEBHOOK_URL = env("SLACK_WEBHOOK_URL")
@@ -127,13 +142,18 @@ def platform_status():
     yt_enabled = bool(YT_CLIENT_ID and YT_CLIENT_SECRET and YT_REFRESH_TOKEN)
     fb_enabled = bool(META_ACCESS_TOKEN and FB_PAGE_ID)
     ig_enabled = bool(IG_ACCESS_TOKEN and IG_USER_ID)
+    tiktok_enabled = bool(TIKTOK_ACCESS_TOKEN and TIKTOK_ENABLED_FLAG)
 
     LOGGER.info("PLATFORM STATUS:")
     LOGGER.info("  YouTube:   %s", "ENABLED" if yt_enabled else "DISABLED (missing env)")
     LOGGER.info("  Facebook:  %s", "ENABLED" if fb_enabled else "DISABLED (missing env)")
     LOGGER.info("  Instagram: %s", "ENABLED" if ig_enabled else "DISABLED (missing env)")
+    LOGGER.info(
+        "  TikTok:    %s",
+        "ENABLED" if tiktok_enabled else "DISABLED (no token or TIKTOK_ENABLED flag is false)",
+    )
 
-    return yt_enabled, fb_enabled, ig_enabled
+    return yt_enabled, fb_enabled, ig_enabled, tiktok_enabled
 
 
 # ------------------------------------------------
@@ -146,7 +166,8 @@ SLOTS = [
         "prefix": "reels n shorts/9am content/",
         "post_youtube": True,
         "post_facebook": True,
-        "post_instagram": True,  # Reels only
+        "post_instagram": True,  # Reels
+        "post_tiktok": True,     # Short to TikTok
     },
     {
         "name": "reel_4pm",
@@ -154,7 +175,8 @@ SLOTS = [
         "prefix": "reels n shorts/4pm content/",
         "post_youtube": True,
         "post_facebook": True,
-        "post_instagram": True,
+        "post_instagram": True,  # Reels
+        "post_tiktok": True,
     },
     {
         "name": "std_9_30am",
@@ -162,7 +184,8 @@ SLOTS = [
         "prefix": "standard videos/9:30am content/",
         "post_youtube": True,
         "post_facebook": True,
-        "post_instagram": False,  # long → IG disabled
+        "post_instagram": True,  # Long → IG feed video
+        "post_tiktok": True,
     },
     {
         "name": "std_4_30pm",
@@ -170,7 +193,8 @@ SLOTS = [
         "prefix": "standard videos/4:30pm content/",
         "post_youtube": True,
         "post_facebook": True,
-        "post_instagram": False,
+        "post_instagram": True,
+        "post_tiktok": True,
     },
 ]
 
@@ -217,6 +241,32 @@ def download_s3_object(key: str):
     s3.download_file(S3_BUCKET_NAME, key, local_path)
     LOGGER.info("Download complete")
     return local_path
+
+
+def archive_s3_object(key: str):
+    """
+    Safer archive:
+    - Copy original object to posted/<original_key>
+    - Delete original key
+    Example:
+      key = 'reels n shorts/9am content/Royal Accident Episode 03.mp4'
+      -> 'posted/reels n shorts/9am content/Royal Accident Episode 03.mp4'
+    """
+    s3 = build_s3_client()
+    dst_key = f"posted/{key}"
+
+    LOGGER.info("Archiving S3 object: %s -> %s", key, dst_key)
+
+    # Copy
+    s3.copy_object(
+        Bucket=S3_BUCKET_NAME,
+        CopySource={"Bucket": S3_BUCKET_NAME, "Key": key},
+        Key=dst_key,
+    )
+
+    # Delete original
+    s3.delete_object(Bucket=S3_BUCKET_NAME, Key=key)
+    LOGGER.info("Archive complete, original removed: %s", key)
 
 
 # ------------------------------------------------
@@ -338,7 +388,7 @@ def upload_to_instagram_reels(s3_key: str, meta: dict, slot: dict):
     Uses: IG_ACCESS_TOKEN, IG_USER_ID
     """
     if slot["type"] != "short":
-        LOGGER.info("[%s] Instagram disabled for standard videos (long).", slot["name"])
+        LOGGER.info("[%s] Instagram Reels disabled for standard videos.", slot["name"])
         return False
 
     if not IG_ACCESS_TOKEN or not IG_USER_ID:
@@ -353,7 +403,7 @@ def upload_to_instagram_reels(s3_key: str, meta: dict, slot: dict):
             ExpiresIn=7200,
         )
     except Exception as e:
-        LOGGER.error("[%s] Failed to generate pre-signed URL for IG: %s", slot["name"], e)
+        LOGGER.error("[%s] Failed to generate pre-signed URL for IG Reels: %s", slot["name"], e)
         return False
 
     LOGGER.info("[%s] [Instagram REELS] Creating media container...", slot["name"])
@@ -368,11 +418,11 @@ def upload_to_instagram_reels(s3_key: str, meta: dict, slot: dict):
 
     r = requests.post(create_url, data=payload)
     if r.status_code != 200:
-        LOGGER.error("[%s] IG container create FAILED: %s", slot["name"], r.text)
+        LOGGER.error("[%s] IG Reels container create FAILED: %s", slot["name"], r.text)
         return False
 
     cid = r.json().get("id")
-    LOGGER.info("[%s] IG container created — ID: %s", slot["name"], cid)
+    LOGGER.info("[%s] IG Reels container created — ID: %s", slot["name"], cid)
 
     # Poll status (up to ~1 minute)
     status_data = {}
@@ -399,7 +449,7 @@ def upload_to_instagram_reels(s3_key: str, meta: dict, slot: dict):
             break
 
     if status_data.get("status_code") != "FINISHED":
-        LOGGER.error("[%s] IG media not ready after polling. Giving up.", slot["name"])
+        LOGGER.error("[%s] IG Reels media not ready after polling. Giving up.", slot["name"])
         return False
 
     # Publish
@@ -410,17 +460,133 @@ def upload_to_instagram_reels(s3_key: str, meta: dict, slot: dict):
     }
     pr = requests.post(pub_url, data=pub_payload)
     if pr.status_code == 200:
-        LOGGER.info("[%s] IG PUBLISH success — %s", slot["name"], pr.text)
+        LOGGER.info("[%s] IG REELS PUBLISH success — %s", slot["name"], pr.text)
         return True
 
-    LOGGER.error("[%s] IG PUBLISH failed — %s", slot["name"], pr.text)
+    LOGGER.error("[%s] IG REELS PUBLISH failed — %s", slot["name"], pr.text)
     return False
+
+
+# ------------------------------------------------
+# Instagram: Feed video (long / standard slots)
+# ------------------------------------------------
+def upload_to_instagram_video(s3_key: str, meta: dict, slot: dict):
+    """
+    Uploads a long video as a normal Instagram video post via pre-signed S3 URL.
+    Uses: IG_ACCESS_TOKEN, IG_USER_ID
+    """
+    if slot["type"] != "standard":
+        LOGGER.info("[%s] Instagram long video is only used for standard slots.", slot["name"])
+        return False
+
+    if not IG_ACCESS_TOKEN or not IG_USER_ID:
+        LOGGER.info("[%s] Instagram disabled globally (env missing). Skipping.", slot["name"])
+        return False
+
+    s3 = build_s3_client()
+    try:
+        presigned_url = s3.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": S3_BUCKET_NAME, "Key": s3_key},
+            ExpiresIn=7200,
+        )
+    except Exception as e:
+        LOGGER.error("[%s] Failed to generate pre-signed URL for IG video: %s", slot["name"], e)
+        return False
+
+    LOGGER.info("[%s] [Instagram VIDEO] Creating media container...", slot["name"])
+    create_url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/media"
+
+    payload = {
+        "media_type": "VIDEO",  # feed video
+        "video_url": presigned_url,
+        "caption": meta["caption"],
+        "access_token": IG_ACCESS_TOKEN,
+    }
+
+    r = requests.post(create_url, data=payload)
+    if r.status_code != 200:
+        LOGGER.error("[%s] IG video container create FAILED: %s", slot["name"], r.text)
+        return False
+
+    cid = r.json().get("id")
+    LOGGER.info("[%s] IG video container created — ID: %s", slot["name"], cid)
+
+    # Poll status (up to ~1–2 minutes)
+    status_data = {}
+    for sec in [0, 7, 15, 23, 31, 39, 47, 55, 63, 71]:
+        time.sleep(8)
+        status_url = f"https://graph.facebook.com/v18.0/{cid}"
+        params = {
+            "fields": "status_code,status",
+            "access_token": IG_ACCESS_TOKEN,
+        }
+        sr = requests.get(status_url, params=params)
+        try:
+            status_data = sr.json()
+        except Exception:
+            status_data = {}
+        LOGGER.info(
+            "[%s] [Instagram VIDEO] Status (%ss): status_code=%s, status=%s",
+            slot["name"],
+            sec,
+            status_data.get("status_code"),
+            status_data.get("status"),
+        )
+        if status_data.get("status_code") == "FINISHED":
+            break
+
+    if status_data.get("status_code") != "FINISHED":
+        LOGGER.error("[%s] IG video media not ready after polling. Giving up.", slot["name"])
+        return False
+
+    # Publish
+    pub_url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/media_publish"
+    pub_payload = {
+        "creation_id": cid,
+        "access_token": IG_ACCESS_TOKEN,
+    }
+    pr = requests.post(pub_url, data=pub_payload)
+    if pr.status_code == 200:
+        LOGGER.info("[%s] IG VIDEO PUBLISH success — %s", slot["name"], pr.text)
+        return True
+
+    LOGGER.error("[%s] IG VIDEO PUBLISH failed — %s", slot["name"], pr.text)
+    return False
+
+
+# ------------------------------------------------
+# TikTok uploader wrapper (short + long)
+# ------------------------------------------------
+def upload_to_tiktok(local_path: str, meta: dict, slot_name: str):
+    """
+    Uploads a video file to TikTok using tiktok_poster.post_video_to_tiktok.
+    Works for both short and standard videos (up to your account's max duration).
+    """
+    if not (TIKTOK_ACCESS_TOKEN and TIKTOK_ENABLED_FLAG):
+        LOGGER.info("[%s] TikTok disabled globally (no token or TIKTOK_ENABLED=false).", slot_name)
+        return False
+
+    # Basic caption: title + date + hashtag
+    caption = f"{meta['title']} | {meta['date']} #cre8studio"
+
+    try:
+        LOGGER.info("[%s] Uploading to TikTok...", slot_name)
+        publish_id, status = post_video_to_tiktok(local_path, caption)
+        LOGGER.info("[%s] TikTok upload SUCCESS — publish_id=%s status=%s", slot_name, publish_id, status)
+        return True
+    except TikTokError as e:
+        LOGGER.error("[%s] TikTok upload FAILED: %s", slot_name, e)
+        return False
+    except Exception as e:
+        LOGGER.error("[%s] TikTok unexpected error: %s", slot_name, e)
+        return False
 
 
 # ------------------------------------------------
 # Slot executor
 # ------------------------------------------------
-def run_slot(slot: dict, yt_enabled: bool, fb_enabled: bool, ig_enabled: bool):
+def run_slot(slot: dict, yt_enabled: bool, fb_enabled: bool, ig_enabled: bool, tiktok_enabled: bool):
     name = slot["name"]
     prefix = slot["prefix"]
     LOGGER.info("=" * 65)
@@ -455,13 +621,33 @@ def run_slot(slot: dict, yt_enabled: bool, fb_enabled: bool, ig_enabled: bool):
 
     # Instagram
     if slot.get("post_instagram") and ig_enabled:
-        ig_ok = upload_to_instagram_reels(s3_key, meta, slot)
+        if slot["type"] == "short":
+            ig_ok = upload_to_instagram_reels(s3_key, meta, slot)
+        else:
+            ig_ok = upload_to_instagram_video(s3_key, meta, slot)
         if not ig_ok:
             all_ok = False
     elif slot.get("post_instagram"):
         LOGGER.info("[%s] Instagram is disabled globally (env missing).", name)
 
-    return "SUCCESS" if all_ok else "FAILED"
+    # TikTok
+    if slot.get("post_tiktok") and tiktok_enabled:
+        tt_ok = upload_to_tiktok(local_path, meta, name)
+        if not tt_ok:
+            all_ok = False
+    elif slot.get("post_tiktok"):
+        LOGGER.info("[%s] TikTok is disabled globally (env missing token or flag).", name)
+
+    # Archive S3 object IF and ONLY IF all enabled platforms succeeded
+    if all_ok:
+        try:
+            archive_s3_object(s3_key)
+        except Exception as e:
+            LOGGER.error("[%s] Failed to archive S3 object '%s': %s", name, s3_key, e)
+            all_ok = False
+
+    status = "SUCCESS" if all_ok else "FAILED"
+    return status
 
 
 # ------------------------------------------------
@@ -478,7 +664,7 @@ if __name__ == "__main__":
         LOGGER.info("SLOT_FILTER not set. All slots will be processed.")
 
     # 2) Determine platform status
-    yt_enabled, fb_enabled, ig_enabled = platform_status()
+    yt_enabled, fb_enabled, ig_enabled, tiktok_enabled = platform_status()
 
     # 3) Run slots
     run_summary = {}
@@ -487,7 +673,7 @@ if __name__ == "__main__":
         if SLOT_FILTER and slot["name"] != SLOT_FILTER:
             continue
 
-        status = run_slot(slot, yt_enabled, fb_enabled, ig_enabled)
+        status = run_slot(slot, yt_enabled, fb_enabled, ig_enabled, tiktok_enabled)
         run_summary[slot["name"]] = status
 
     # 4) Summary
