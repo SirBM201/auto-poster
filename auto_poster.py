@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-AUTO POSTING ENGINE v2.4  — BM SAFE VERSION (ENV-ONLY YOUTUBE + TIKTOK + IG LONG)
----------------------------------------------------------------------------------
+AUTO POSTING ENGINE v2.5  — BM SAFE VERSION (ALL PLATFORMS + CLEANUP)
+---------------------------------------------------------------------
 - One script, multiple slots (reel_9am, reel_4pm, std_9_30am, std_4_30pm)
 - S3 → Download
 - Filename → Metadata (title/caption/date)
@@ -17,6 +17,7 @@ AUTO POSTING ENGINE v2.4  — BM SAFE VERSION (ENV-ONLY YOUTUBE + TIKTOK + IG LO
     - Copy S3 object to posted/<original_key>
     - Delete original object
 - Slot filter via SLOT_FILTER env (for GitHub Actions cron)
+- Cleanup posted/ objects older than 48 hours on each run
 
 ENV RULES:
 ----------
@@ -55,7 +56,7 @@ import os
 import re
 import time
 import logging
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 
 import boto3
 from botocore.exceptions import ClientError
@@ -79,6 +80,11 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger("auto_poster")
 
+# ------------------------------------------------
+# YouTube robustness settings
+# ------------------------------------------------
+MAX_YT_RETRIES = 3          # how many times to retry YouTube upload
+YT_RETRY_SLEEP = 20         # seconds to wait between retries
 
 # ------------------------------------------------
 # Environment helpers
@@ -212,6 +218,10 @@ def build_s3_client():
 
 
 def get_latest_video_key(prefix: str):
+    """
+    Returns the latest .mp4 key under the prefix that contains TODAY's date
+    (YYYY-MM-DD) in the filename. If none match, returns None.
+    """
     s3 = build_s3_client()
     resp = s3.list_objects_v2(Bucket=S3_BUCKET_NAME, Prefix=prefix)
 
@@ -219,13 +229,26 @@ def get_latest_video_key(prefix: str):
         LOGGER.warning("No objects found under prefix '%s'", prefix)
         return None
 
-    mp4s = [obj["Key"] for obj in resp["Contents"] if obj["Key"].lower().endswith(".mp4")]
-    if not mp4s:
+    today_str = str(date.today())  # 'YYYY-MM-DD'
+    all_mp4s = [obj["Key"] for obj in resp["Contents"] if obj["Key"].lower().endswith(".mp4")]
+
+    # Filter only files that have today's date in the basename
+    mp4s_today = [
+        key for key in all_mp4s
+        if today_str in os.path.basename(key)
+    ]
+
+    if not mp4s_today:
+        LOGGER.warning(
+            "No .mp4 files for TODAY (%s) found under prefix '%s'. "
+            "Existing or future-dated files are left untouched.",
+            today_str,
+            prefix,
+        )
         return None
 
-    # Sort by key (assuming keys have date/time in name)
-    mp4s.sort()
-    latest_key = mp4s[-1]
+    mp4s_today.sort()
+    latest_key = mp4s_today[-1]
     return latest_key
 
 
@@ -249,8 +272,8 @@ def archive_s3_object(key: str):
     - Copy original object to posted/<original_key>
     - Delete original key
     Example:
-      key = 'reels n shorts/9am content/Royal Accident Episode 03.mp4'
-      -> 'posted/reels n shorts/9am content/Royal Accident Episode 03.mp4'
+      key = 'reels n shorts/9am content/2025-12-09 Heir vs. Beast.mp4'
+      -> 'posted/reels n shorts/9am content/2025-12-09 Heir vs. Beast.mp4'
     """
     s3 = build_s3_client()
     dst_key = f"posted/{key}"
@@ -291,16 +314,20 @@ def parse_metadata_from_key(key: str):
 
 
 # ------------------------------------------------
-# YouTube uploader
+# YouTube uploader (robust with retry + safe failure)
 # ------------------------------------------------
 def upload_to_youtube(file_path: str, meta: dict):
     """
-    Simple YouTube uploader.
+    YouTube uploader with retry and safe failure.
 
     Expects these env vars:
       - YT_CLIENT_ID
       - YT_CLIENT_SECRET
       - YT_REFRESH_TOKEN
+
+    Returns:
+        True  -> upload succeeded
+        False -> upload failed after retries or env/credentials issue
     """
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
@@ -322,7 +349,11 @@ def upload_to_youtube(file_path: str, meta: dict):
         scopes=["https://www.googleapis.com/auth/youtube.upload"],
     )
 
-    youtube = build("youtube", "v3", credentials=creds)
+    try:
+        youtube = build("youtube", "v3", credentials=creds)
+    except Exception as e:
+        LOGGER.error("YouTube: failed to build API client: %s", e, exc_info=True)
+        return False
 
     body = {
         "snippet": {
@@ -336,7 +367,6 @@ def upload_to_youtube(file_path: str, meta: dict):
     }
 
     media = MediaFileUpload(file_path, chunksize=-1, resumable=True)
-
     request = youtube.videos().insert(
         part="snippet,status",
         body=body,
@@ -344,14 +374,47 @@ def upload_to_youtube(file_path: str, meta: dict):
     )
 
     response = None
-    while response is None:
-        status, response = request.next_chunk()
 
-    if response and "id" in response:
-        LOGGER.info("YouTube upload success — video ID: %s", response["id"])
-        return True
+    for attempt in range(1, MAX_YT_RETRIES + 1):
+        LOGGER.info("YouTube: upload attempt %d/%d", attempt, MAX_YT_RETRIES)
+        try:
+            while response is None:
+                status, response = request.next_chunk()
+                if status is not None:
+                    LOGGER.info("YouTube: upload progress %.2f%%", status.progress() * 100.0)
 
-    LOGGER.error("YouTube upload failed. Response: %s", response)
+            if response and "id" in response:
+                LOGGER.info("YouTube upload success — video ID: %s", response["id"])
+                return True
+
+            LOGGER.error("YouTube upload failed. Response: %s", response)
+            return False
+
+        except Exception as e:
+            LOGGER.error(
+                "YouTube: upload attempt %d failed: %s",
+                attempt,
+                e,
+                exc_info=True,
+            )
+
+            if attempt >= MAX_YT_RETRIES:
+                LOGGER.error(
+                    "YouTube: giving up after %d attempts. "
+                    "Continuing with Facebook / Instagram / TikTok.",
+                    MAX_YT_RETRIES,
+                )
+                return False
+
+            LOGGER.info(
+                "YouTube: will retry in %d seconds (attempt %d/%d)...",
+                YT_RETRY_SLEEP,
+                attempt + 1,
+                MAX_YT_RETRIES,
+            )
+            time.sleep(YT_RETRY_SLEEP)
+
+    # Should not reach here, but keep safe
     return False
 
 
@@ -363,13 +426,17 @@ def upload_to_facebook(file_path: str, meta: dict, slot_name: str):
         LOGGER.info("[%s] Facebook disabled globally (env missing). Skipping.", slot_name)
         return False
 
-    LOGGER.info("[%s] Uploading to Facebook Page via fb_chunk_upload...", slot_name)
-    ok = fb_chunk_upload(
-        file_path=file_path,
-        page_id=FB_PAGE_ID,
-        access_token=META_ACCESS_TOKEN,
-        caption=meta["caption"],
-    )
+    try:
+        LOGGER.info("[%s] Uploading to Facebook Page via fb_chunk_upload...", slot_name)
+        ok = fb_chunk_upload(
+            file_path=file_path,
+            page_id=FB_PAGE_ID,
+            access_token=META_ACCESS_TOKEN,
+            caption=meta["caption"],
+        )
+    except Exception as e:
+        LOGGER.error("[%s] Facebook upload ERROR: %s", slot_name, e, exc_info=True)
+        return False
 
     if ok:
         LOGGER.info("[%s] Facebook upload SUCCESS", slot_name)
@@ -386,6 +453,7 @@ def upload_to_instagram_reels(s3_key: str, meta: dict, slot: dict):
     """
     Uploads a short video as a Reel via pre-signed S3 URL.
     Uses: IG_ACCESS_TOKEN, IG_USER_ID
+    Safe failure: Any exception returns False and does not crash script.
     """
     if slot["type"] != "short":
         LOGGER.info("[%s] Instagram Reels disabled for standard videos.", slot["name"])
@@ -395,76 +463,77 @@ def upload_to_instagram_reels(s3_key: str, meta: dict, slot: dict):
         LOGGER.info("[%s] Instagram disabled globally (env missing). Skipping.", slot["name"])
         return False
 
-    s3 = build_s3_client()
     try:
+        s3 = build_s3_client()
         presigned_url = s3.generate_presigned_url(
             ClientMethod="get_object",
             Params={"Bucket": S3_BUCKET_NAME, "Key": s3_key},
             ExpiresIn=7200,
         )
-    except Exception as e:
-        LOGGER.error("[%s] Failed to generate pre-signed URL for IG Reels: %s", slot["name"], e)
-        return False
 
-    LOGGER.info("[%s] [Instagram REELS] Creating media container...", slot["name"])
-    create_url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/media"
+        LOGGER.info("[%s] [Instagram REELS] Creating media container...", slot["name"])
+        create_url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/media"
 
-    payload = {
-        "media_type": "REELS",
-        "video_url": presigned_url,
-        "caption": meta["caption"],
-        "access_token": IG_ACCESS_TOKEN,
-    }
-
-    r = requests.post(create_url, data=payload)
-    if r.status_code != 200:
-        LOGGER.error("[%s] IG Reels container create FAILED: %s", slot["name"], r.text)
-        return False
-
-    cid = r.json().get("id")
-    LOGGER.info("[%s] IG Reels container created — ID: %s", slot["name"], cid)
-
-    # Poll status (up to ~1 minute)
-    status_data = {}
-    for sec in [0, 5, 11, 17, 23, 29, 35, 41, 47, 53]:
-        time.sleep(6)
-        status_url = f"https://graph.facebook.com/v18.0/{cid}"
-        params = {
-            "fields": "status_code,status",
+        payload = {
+            "media_type": "REELS",
+            "video_url": presigned_url,
+            "caption": meta["caption"],
             "access_token": IG_ACCESS_TOKEN,
         }
-        sr = requests.get(status_url, params=params)
-        try:
-            status_data = sr.json()
-        except Exception:
-            status_data = {}
-        LOGGER.info(
-            "[%s] [Instagram REELS] Status (%ss): status_code=%s, status=%s",
-            slot["name"],
-            sec,
-            status_data.get("status_code"),
-            status_data.get("status"),
-        )
-        if status_data.get("status_code") == "FINISHED":
-            break
 
-    if status_data.get("status_code") != "FINISHED":
-        LOGGER.error("[%s] IG Reels media not ready after polling. Giving up.", slot["name"])
+        r = requests.post(create_url, data=payload)
+        if r.status_code != 200:
+            LOGGER.error("[%s] IG Reels container create FAILED: %s", slot["name"], r.text)
+            return False
+
+        cid = r.json().get("id")
+        LOGGER.info("[%s] IG Reels container created — ID: %s", slot["name"], cid)
+
+        # Poll status (up to ~1 minute)
+        status_data = {}
+        for sec in [0, 5, 11, 17, 23, 29, 35, 41, 47, 53]:
+            time.sleep(6)
+            status_url = f"https://graph.facebook.com/v18.0/{cid}"
+            params = {
+                "fields": "status_code,status",
+                "access_token": IG_ACCESS_TOKEN,
+            }
+            sr = requests.get(status_url, params=params)
+            try:
+                status_data = sr.json()
+            except Exception:
+                status_data = {}
+            LOGGER.info(
+                "[%s] [Instagram REELS] Status (%ss): status_code=%s, status=%s",
+                slot["name"],
+                sec,
+                status_data.get("status_code"),
+                status_data.get("status"),
+            )
+            if status_data.get("status_code") == "FINISHED":
+                break
+
+        if status_data.get("status_code") != "FINISHED":
+            LOGGER.error("[%s] IG Reels media not ready after polling. Giving up.", slot["name"])
+            return False
+
+        # Publish
+        pub_url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/media_publish"
+        pub_payload = {
+            "creation_id": cid,
+            "access_token": IG_ACCESS_TOKEN,
+        }
+        pr = requests.post(pub_url, data=pub_payload)
+        if pr.status_code == 200:
+            LOGGER.info("[%s] IG REELS PUBLISH success — %s", slot["name"], pr.text)
+            return True
+
+        LOGGER.error("[%s] IG REELS PUBLISH failed — %s", slot["name"], pr.text)
         return False
 
-    # Publish
-    pub_url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/media_publish"
-    pub_payload = {
-        "creation_id": cid,
-        "access_token": IG_ACCESS_TOKEN,
-    }
-    pr = requests.post(pub_url, data=pub_payload)
-    if pr.status_code == 200:
-        LOGGER.info("[%s] IG REELS PUBLISH success — %s", slot["name"], pr.text)
-        return True
-
-    LOGGER.error("[%s] IG REELS PUBLISH failed — %s", slot["name"], pr.text)
-    return False
+    except Exception as e:
+        LOGGER.error("[%s] Instagram Reels upload ERROR: %s", slot["name"], e, exc_info=True)
+        return False
 
 
 # ------------------------------------------------
@@ -474,6 +543,7 @@ def upload_to_instagram_video(s3_key: str, meta: dict, slot: dict):
     """
     Uploads a long video as a normal Instagram video post via pre-signed S3 URL.
     Uses: IG_ACCESS_TOKEN, IG_USER_ID
+    Safe failure: Any exception returns False and does not crash script.
     """
     if slot["type"] != "standard":
         LOGGER.info("[%s] Instagram long video is only used for standard slots.", slot["name"])
@@ -483,76 +553,77 @@ def upload_to_instagram_video(s3_key: str, meta: dict, slot: dict):
         LOGGER.info("[%s] Instagram disabled globally (env missing). Skipping.", slot["name"])
         return False
 
-    s3 = build_s3_client()
     try:
+        s3 = build_s3_client()
         presigned_url = s3.generate_presigned_url(
             ClientMethod="get_object",
             Params={"Bucket": S3_BUCKET_NAME, "Key": s3_key},
             ExpiresIn=7200,
         )
-    except Exception as e:
-        LOGGER.error("[%s] Failed to generate pre-signed URL for IG video: %s", slot["name"], e)
-        return False
 
-    LOGGER.info("[%s] [Instagram VIDEO] Creating media container...", slot["name"])
-    create_url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/media"
+        LOGGER.info("[%s] [Instagram VIDEO] Creating media container...", slot["name"])
+        create_url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/media"
 
-    payload = {
-        "media_type": "VIDEO",  # feed video
-        "video_url": presigned_url,
-        "caption": meta["caption"],
-        "access_token": IG_ACCESS_TOKEN,
-    }
-
-    r = requests.post(create_url, data=payload)
-    if r.status_code != 200:
-        LOGGER.error("[%s] IG video container create FAILED: %s", slot["name"], r.text)
-        return False
-
-    cid = r.json().get("id")
-    LOGGER.info("[%s] IG video container created — ID: %s", slot["name"], cid)
-
-    # Poll status (up to ~1–2 minutes)
-    status_data = {}
-    for sec in [0, 7, 15, 23, 31, 39, 47, 55, 63, 71]:
-        time.sleep(8)
-        status_url = f"https://graph.facebook.com/v18.0/{cid}"
-        params = {
-            "fields": "status_code,status",
+        payload = {
+            "media_type": "VIDEO",  # feed video
+            "video_url": presigned_url,
+            "caption": meta["caption"],
             "access_token": IG_ACCESS_TOKEN,
         }
-        sr = requests.get(status_url, params=params)
-        try:
-            status_data = sr.json()
-        except Exception:
-            status_data = {}
-        LOGGER.info(
-            "[%s] [Instagram VIDEO] Status (%ss): status_code=%s, status=%s",
-            slot["name"],
-            sec,
-            status_data.get("status_code"),
-            status_data.get("status"),
-        )
-        if status_data.get("status_code") == "FINISHED":
-            break
 
-    if status_data.get("status_code") != "FINISHED":
-        LOGGER.error("[%s] IG video media not ready after polling. Giving up.", slot["name"])
+        r = requests.post(create_url, data=payload)
+        if r.status_code != 200:
+            LOGGER.error("[%s] IG video container create FAILED: %s", slot["name"], r.text)
+            return False
+
+        cid = r.json().get("id")
+        LOGGER.info("[%s] IG video container created — ID: %s", slot["name"], cid)
+
+        # Poll status (up to ~1–2 minutes)
+        status_data = {}
+        for sec in [0, 7, 15, 23, 31, 39, 47, 55, 63, 71]:
+            time.sleep(8)
+            status_url = f"https://graph.facebook.com/v18.0/{cid}"
+            params = {
+                "fields": "status_code,status",
+                "access_token": IG_ACCESS_TOKEN,
+            }
+            sr = requests.get(status_url, params=params)
+            try:
+                status_data = sr.json()
+            except Exception:
+                status_data = {}
+            LOGGER.info(
+                "[%s] [Instagram VIDEO] Status (%ss): status_code=%s, status=%s",
+                slot["name"],
+                sec,
+                status_data.get("status_code"),
+                status_data.get("status"),
+            )
+            if status_data.get("status_code") == "FINISHED":
+                break
+
+        if status_data.get("status_code") != "FINISHED":
+            LOGGER.error("[%s] IG video media not ready after polling. Giving up.", slot["name"])
+            return False
+
+        # Publish
+        pub_url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/media_publish"
+        pub_payload = {
+            "creation_id": cid,
+            "access_token": IG_ACCESS_TOKEN,
+        }
+        pr = requests.post(pub_url, data=pub_payload)
+        if pr.status_code == 200:
+            LOGGER.info("[%s] IG VIDEO PUBLISH success — %s", slot["name"], pr.text)
+            return True
+
+        LOGGER.error("[%s] IG VIDEO PUBLISH failed — %s", slot["name"], pr.text)
         return False
 
-    # Publish
-    pub_url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/media_publish"
-    pub_payload = {
-        "creation_id": cid,
-        "access_token": IG_ACCESS_TOKEN,
-    }
-    pr = requests.post(pub_url, data=pub_payload)
-    if pr.status_code == 200:
-        LOGGER.info("[%s] IG VIDEO PUBLISH success — %s", slot["name"], pr.text)
-        return True
-
-    LOGGER.error("[%s] IG VIDEO PUBLISH failed — %s", slot["name"], pr.text)
-    return False
+    except Exception as e:
+        LOGGER.error("[%s] Instagram VIDEO upload ERROR: %s", slot["name"], e, exc_info=True)
+        return False
 
 
 # ------------------------------------------------
@@ -562,6 +633,7 @@ def upload_to_tiktok(local_path: str, meta: dict, slot_name: str):
     """
     Uploads a video file to TikTok using tiktok_poster.post_video_to_tiktok.
     Works for both short and standard videos (up to your account's max duration).
+    Safe failure: Any exception returns False and does not crash script.
     """
     if not (TIKTOK_ACCESS_TOKEN and TIKTOK_ENABLED_FLAG):
         LOGGER.info("[%s] TikTok disabled globally (no token or TIKTOK_ENABLED=false).", slot_name)
@@ -579,8 +651,51 @@ def upload_to_tiktok(local_path: str, meta: dict, slot_name: str):
         LOGGER.error("[%s] TikTok upload FAILED: %s", slot_name, e)
         return False
     except Exception as e:
-        LOGGER.error("[%s] TikTok unexpected error: %s", slot_name, e)
+        LOGGER.error("[%s] TikTok unexpected error: %s", slot_name, e, exc_info=True)
         return False
+
+
+# ------------------------------------------------
+# Cleanup logic for posted/ objects older than X hours
+# ------------------------------------------------
+def cleanup_posted_objects(max_age_hours: int = 48):
+    """
+    Deletes objects under 'posted/' that are older than max_age_hours.
+    Runs at the end of the script.
+    """
+    s3 = build_s3_client()
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    prefix = "posted/"
+    LOGGER.info("Cleaning up posted objects older than %d hours...", max_age_hours)
+
+    continuation_token = None
+    deleted = 0
+
+    while True:
+        kwargs = {"Bucket": S3_BUCKET_NAME, "Prefix": prefix}
+        if continuation_token:
+            kwargs["ContinuationToken"] = continuation_token
+
+        resp = s3.list_objects_v2(**kwargs)
+        contents = resp.get("Contents", [])
+
+        for obj in contents:
+            key = obj["Key"]
+            last_modified = obj["LastModified"]  # timezone-aware UTC datetime
+            if last_modified < cutoff:
+                try:
+                    s3.delete_object(Bucket=S3_BUCKET_NAME, Key=key)
+                    deleted += 1
+                    LOGGER.info("Deleted old posted object: %s", key)
+                except Exception as e:
+                    LOGGER.error("Failed to delete posted object '%s': %s", key, e, exc_info=True)
+
+        if not resp.get("IsTruncated"):
+            break
+
+        continuation_token = resp.get("NextContinuationToken")
+
+    LOGGER.info("Cleanup complete. Deleted %d old posted objects.", deleted)
 
 
 # ------------------------------------------------
@@ -594,7 +709,7 @@ def run_slot(slot: dict, yt_enabled: bool, fb_enabled: bool, ig_enabled: bool, t
 
     s3_key = get_latest_video_key(prefix)
     if not s3_key:
-        LOGGER.warning("[%s] No .mp4 files found in prefix '%s'", name, prefix)
+        LOGGER.warning("[%s] No TODAY file found. Slot skipped.", name)
         return "SKIPPED"
 
     LOGGER.info("[%s] Using video: %s", name, s3_key)
@@ -643,7 +758,7 @@ def run_slot(slot: dict, yt_enabled: bool, fb_enabled: bool, ig_enabled: bool, t
         try:
             archive_s3_object(s3_key)
         except Exception as e:
-            LOGGER.error("[%s] Failed to archive S3 object '%s': %s", name, s3_key, e)
+            LOGGER.error("[%s] Failed to archive S3 object '%s': %s", name, s3_key, e, exc_info=True)
             all_ok = False
 
     status = "SUCCESS" if all_ok else "FAILED"
@@ -681,3 +796,6 @@ if __name__ == "__main__":
     LOGGER.info("RUN SUMMARY:")
     for slot_name, status in run_summary.items():
         LOGGER.info("  %s: %s", slot_name, status)
+
+    # 5) Cleanup posted/ older than 48 hours
+    cleanup_posted_objects(max_age_hours=48)
